@@ -546,8 +546,16 @@
 
     if (!item) { this.useTimer = 0; this.triggerPrev = false; return; }
 
-    var left = BN.Input.mouse.left;
-    var blocked = BN.Input.isBlocked && BN.Input.isBlocked();
+    /* Bots set owner.fireHeld themselves; the human player reads the device.
+       This keeps ONE weapon controller for everyone without bots inheriting
+       the player's mouse state. */
+    var left, blocked = false;
+    if (owner.isBot && owner.isBot()) {
+      left = !!this.intentFire;
+    } else {
+      left = BN.Input.mouse.left;
+      blocked = BN.Input.isBlocked ? BN.Input.isBlocked() : false;
+    }
     var canAct = owner.alive !== false && owner.control !== false && !blocked;
 
     if (item.kind === 'consumable') {
