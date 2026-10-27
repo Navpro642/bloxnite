@@ -152,6 +152,16 @@
   /* ------------------------------ input -------------------------------- */
   Player.prototype.readLook = function () {
     if (!this.alive || !this.control) return;
+    /* Bots write this.intent.lookX/lookY instead of using the mouse. One
+       look path, two intent sources — no second camera/rotation controller. */
+    if (this.intent) {
+      this.yaw -= this.intent.lookX;
+      this.pitch -= this.intent.lookY;
+      this.intent.lookX = 0;
+      this.intent.lookY = 0;
+      this.pitch = U.clamp(this.pitch, -1.16, 1.05);
+      return;
+    }
     if (!BN.Input.isLocked() || BN.Input.isBlocked()) return;
     var m = BN.Input.mouse;
     var k = 0.0021 * this.sens;
