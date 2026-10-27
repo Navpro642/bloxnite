@@ -176,6 +176,17 @@
       this.wantJump = false;
       return;
     }
+    /* Bot intent: same fields the keyboard path produces, so movement,
+       jump and aiming all flow through this one controller. */
+    if (this.intent) {
+      var it = this.intent;
+      this.wantJump = !!it.jump;
+      this.crouch = !!it.crouch;
+      this.sprinting = !!it.sprint;
+      this.aiming = !!it.aim && !it.sprint;
+      it.jump = false;
+      return;
+    }
     var I = BN.Input;
     this.wantJump = I.down('Space');
     this.crouch = I.down('ControlLeft') || I.down('KeyC');
