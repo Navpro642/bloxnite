@@ -1,15 +1,16 @@
 /* ==========================================================================
    BLOXNITE — bots (offline opponents, NOT real multiplayer)
-   Lightweight actors that reuse the shared physics (BN.Physics), the shared
-   character rig, and the ONE WeaponController. No per-bot cameras, no
-   per-bot shadow casters: 20+ bots stay cheap on a mid-range laptop.
+   Bots reuse the shared physics (BN.Physics), the shared character rig and the
+   ONE WeaponController. They must expose the same owner surface the controller
+   expects: eyePos, lookDir, hitSpheres, damage, inventory, emit, isBot.
+   No per-bot cameras and no per-bot shadow casters, so 20 bots stay cheap.
    ========================================================================== */
 (function () {
   var BN = (window.BN = window.BN || {});
   var U = BN.util;
 
   var SIGHT = 62;          /* metres a bot can notice a target */
-  var REACTION = 0.34;     /* seconds of delay before it starts shooting */
+  var REACTION = 0.34;     /* seconds of hesitation before it opens fire */
   var LOSE_SIGHT = 1.6;    /* seconds of memory after losing line of sight */
 
   var NAMES = [
@@ -19,6 +20,16 @@
     'Cobalt', 'Dune', 'Ember', 'Flint', 'Gale', 'Hollow', 'Ink', 'Jasper'
   ];
 
+  var KIT = ['ar_common', 'smg_uncommon', 'shotgun_common', 'pistol_common', 'ar_rare', 'sniper_rare'];
+
+  function defaultPalette() {
+    if (BN.Save && BN.Save.palette) {
+      var p = BN.Save.palette();
+      if (p) return p;
+    }
+    return { shirt: '#2f6bff', pants: '#1b2550', skin: '#f0c39d', accent: '#37e5ff', hat: 'cap', hatColor: '#37e5ff' };
+  }
+
   function Bot(THREE, world, scene, opts) {
     opts = opts || {};
     this.THREE = THREE;
@@ -26,7 +37,7 @@
     this.scene = scene;
 
     this.id = 'bot' + (Bot._seq = (Bot._seq || 0) + 1);
-    this.name = opts.name || NAMES[(Math.random() * NAMES.length) | 0];
+    this.name = opts.name || U.pick(NAMES);
 
     this.pos = new THREE.Vector3(0, 0, 0);
     this.vel = new THREE.Vector3();
@@ -46,28 +57,29 @@
     this.sprinting = false;
     this.crouch = false;
     this.wantJump = false;
+    this.moveInput = { x: 0, z: 0 };
 
     this.kills = 0;
     this.events = {};
 
     /* AI state */
+    this.palette = opts.palette || defaultPalette();
     this.target = null;
     this.targetSeen = 0;
     this.reactTimer = 0;
-    this.state = 'roam';       /* roam | engage | loot | flee */
+    this.state = 'roam';
     this.waypoint = null;
+    this.lootEntry = null;
     this.repathTimer = 0;
     this.strafeDir = Math.random() < 0.5 ? -1 : 1;
     this.strafeTimer = 0;
     this.skill = opts.skill != null ? opts.skill : U.rand(0.45, 0.9);
     this.thinkTimer = Math.random() * 0.4;
     this.jumpCooldown = 0;
-    this.lastShotAt = 0;
     this._v = new THREE.Vector3();
+    this._hiddenAt = 0;
 
-    this.character = new BN.Character(THREE, opts.palette || BN.randomPalette(), {
-      shadows: false
-    });
+    this.character = new BN.Character(THREE, this.palette, { shadows: false });
     this.character.group.visible = false;
     scene.add(this.character.group);
 
@@ -88,13 +100,20 @@
   };
   Bot.prototype.isBot = function () { return true; };
 
-  /* --------------------------- combat surface --------------------------- */
-  /* Mirrors Player so the shared WeaponController and damage code work. */
+  /* --------------------------- owner surface ---------------------------- */
   Bot.prototype.eyePos = function (out) {
     return (out || new this.THREE.Vector3()).set(
       this.pos.x, this.pos.y + (this.crouch ? 1.15 : 1.45), this.pos.z
     );
   };
+
+  /* Forward vector — the shared controller needs this to aim hitscan shots. */
+  Bot.prototype.lookDir = function (out) {
+    var v = out || new this.THREE.Vector3();
+    var cp = Math.cos(this.pitch);
+    return v.set(Math.sin(this.yaw) * cp, Math.sin(this.pitch), Math.cos(this.yaw) * cp);
+  };
+
   Bot.prototype.hitSpheres = function () {
     var p = this.pos;
     return [
@@ -103,8 +122,9 @@
       { x: p.x, y: p.y + 0.45, z: p.z, r: 0.38, part: 'legs' }
     ];
   };
+
   Bot.prototype.damage = function (amount, info) {
-    if (!this.alive || amount <= 0) return 0;
+    if (!this.alive || !(amount > 0)) return 0;
     var left = amount;
     if (this.shield > 0) {
       var absorbed = Math.min(this.shield, left);
@@ -112,31 +132,38 @@
       left -= absorbed;
     }
     this.health -= left;
-    /* being shot makes a bot turn and fight back */
-    if (info && info.from && this.alive) {
-      this.target = info.from;
-      this.targetSeen = LOSE_SIGHT;
-      this.state = 'engage';
-    }
     this.emit('damage', amount, info);
     if (this.health <= 0) {
       this.health = 0;
       this.die(info);
+      return amount;
+    }
+    /* being shot makes a bot turn and fight back */
+    var from = info && (info.from || info.attacker || info.by);
+    if (from && from !== this) {
+      this.target = from;
+      this.targetSeen = LOSE_SIGHT;
+      this.state = 'engage';
     }
     return amount;
   };
+
   Bot.prototype.heal = function (n) {
     this.health = Math.min(this.maxHealth, this.health + n);
   };
   Bot.prototype.addShield = function (n) {
     this.shield = Math.min(this.maxShield, this.shield + n);
   };
+
   Bot.prototype.die = function (info) {
     if (!this.alive) return;
     this.alive = false;
     this.control = false;
     this.vel.set(0, 0, 0);
+    this.aiming = false;
+    this.weapons.intentFire = false;
     this.character.setDead(true);
+    this._hiddenAt = performance.now();
     this.emit('death', info || {});
   };
 
@@ -144,16 +171,18 @@
     var w = this.inventory.activeItem();
     if (w && w.kind === 'weapon') {
       var def = BN.WEAPONS[w.defId];
-      if (def) this.character.setWeapon(def.modelRef, this.palette ? this.palette.accent : null);
-    } else {
-      this.character.setWeapon(null);
+      if (def) {
+        this.character.setWeapon(def.modelRef, this.palette.accent);
+        return;
+      }
     }
+    this.character.setWeapon(null);
   };
 
   Bot.prototype.spawn = function (x, y, z, yaw) {
     this.pos.set(x, y, z);
     this.vel.set(0, 0, 0);
-    this.yaw = yaw || Math.random() * Math.PI * 2;
+    this.yaw = yaw != null ? yaw : Math.random() * Math.PI * 2;
     this.pitch = 0;
     this.alive = true;
     this.control = true;
@@ -163,9 +192,14 @@
     this.target = null;
     this.targetSeen = 0;
     this.waypoint = null;
+    this.lootEntry = null;
+    this.reactTimer = 0;
+    this._hiddenAt = 0;
     this.character.group.visible = true;
     this.character.setDead(false);
     this.character.group.position.copy(this.pos);
+    this.character.group.rotation.set(0, this.yaw, 0);
+    this.syncWeaponModel();
   };
 
   /* ------------------------------- senses ------------------------------- */
@@ -173,12 +207,12 @@
     if (!other || other.alive === false || !other.pos) return false;
     var d = this.pos.distanceTo(other.pos);
     if (d > SIGHT) return false;
-    /* bots use the same occlusion test the player's shots use */
-    var from = this.eyePos(this._v);
-    return this.world.lineOfSight(from.x, from.y, from.z, other.pos.x, other.pos.y + 1.4, other.pos.z);
+    var ex = this.pos.x, ey = this.pos.y + 1.45, ez = this.pos.z;
+    return this.world.lineOfSight(ex, ey, ez, other.pos.x, other.pos.y + 1.4, other.pos.z);
   };
 
   Bot.prototype.nearestEnemy = function (others) {
+    if (!others) return null;
     var best = null, bestD = Infinity;
     for (var i = 0; i < others.length; i++) {
       var o = others[i];
@@ -190,22 +224,22 @@
     return best;
   };
 
-  /* ------------------------------ steering ------------------------------ */
-  /* Pick a destination the bot can actually use: loot if unarmed, otherwise
-     the nearest safe-zone point or a wander target. */
-  Bot.prototype.chooseWaypoint = function (ctx) {
-    var hasGun = false;
+  Bot.prototype.hasGun = function () {
     for (var i = 0; i < 5; i++) {
       var it = this.inventory.slots[i];
-      if (it && it.kind === 'weapon') { hasGun = true; break; }
+      if (it && it.kind === 'weapon') return true;
     }
+    return false;
+  };
 
+  /* ------------------------------ steering ------------------------------ */
+  Bot.prototype.chooseWaypoint = function (ctx) {
     /* unarmed bots run for the closest ground weapon */
-    if (!hasGun && ctx.loot && ctx.loot.items) {
+    if (!this.hasGun() && ctx.loot && ctx.loot.items) {
       var best = null, bestD = Infinity;
       for (var j = 0; j < ctx.loot.items.length; j++) {
         var e = ctx.loot.items[j];
-        if (!e.item || e.item.kind !== 'weapon') continue;
+        if (!e || !e.item || e.item.kind !== 'weapon') continue;
         var d = this.pos.distanceTo(e.mesh.position);
         if (d < 55 && d < bestD) { bestD = d; best = e; }
       }
@@ -215,78 +249,85 @@
       }
     }
 
-    /* stay inside the next zone when the storm is relevant */
-    if (ctx.storm && ctx.storm.active) {
-      var s = ctx.storm;
-      if (s.distanceOutside(this.pos.x, this.pos.z) > -12 || !s.inNextZone(this.pos.x, this.pos.z)) {
+    /* stay inside the incoming zone when the storm matters */
+    var s = ctx.storm;
+    if (s && s.active) {
+      var outside = s.distanceOutside(this.pos.x, this.pos.z);
+      if (outside > -14 || !s.inNextZone(this.pos.x, this.pos.z)) {
         var a = Math.random() * Math.PI * 2;
         var r = Math.random() * Math.max(1, s.next.r * 0.7);
         return { x: s.next.cx + Math.cos(a) * r, z: s.next.cz + Math.sin(a) * r };
       }
     }
 
-    var half = BN.World.HALF - 22;
+    var half = BN.World.HALF - 24;
     return { x: U.rand(-half, half), z: U.rand(-half, half) };
   };
 
   Bot.prototype.stepToward = function (dt, tx, tz) {
     var dx = tx - this.pos.x, dz = tz - this.pos.z;
     var d = Math.hypot(dx, dz);
-    if (d < 0.6) { this.waypoint = null; return false; }
+    if (d < 0.7) { this.waypoint = null; return false; }
 
-    /* desired heading */
     var want = Math.atan2(dx, dz);
 
-    /* obstacle probe: if something blocks us, slide around it */
-    var probe = 1.8;
+    /* obstacle probe — slide around cover instead of grinding into it */
+    var probe = 1.9;
     var px = this.pos.x + Math.sin(want) * probe;
     var pz = this.pos.z + Math.cos(want) * probe;
-    if (!this.world.lineOfSight(this.pos.x, this.pos.y + 1.1, this.pos.z, px, this.pos.y + 1.1, pz)) {
-      want += 0.9 * this.strafeDir;
-      if (this.jumpCooldown <= 0 && Math.random() < 0.3) {
+    var clear = this.world.lineOfSight(this.pos.x, this.pos.y + 1.1, this.pos.z, px, this.pos.y + 1.1, pz);
+    if (!clear) {
+      want += 0.95 * this.strafeDir;
+      if (this.jumpCooldown <= 0 && Math.random() < 0.25) {
         this.wantJump = true;
         this.jumpCooldown = 1.2;
       }
     }
 
-    /* turn smoothly toward the heading */
     var diff = ((want - this.yaw + Math.PI) % (Math.PI * 2)) - Math.PI;
     if (diff < -Math.PI) diff += Math.PI * 2;
     this.yaw += U.clamp(diff, -6 * dt, 6 * dt);
     this.pitch = U.damp(this.pitch, 0, 6, dt);
 
     this.moveInput = { x: 0, z: 1 };
-    this.sprinting = d > 8;
+    this.sprinting = d > 8 && this.grounded;
     return true;
   };
 
   /* -------------------------------- update ------------------------------ */
-  /**
-   * dt   seconds
-   * ctx  { players: [main player + bots], loot, storm, onPickup }
-   */
   Bot.prototype.update = function (dt, ctx) {
+    ctx = ctx || {};
     if (this.jumpCooldown > 0) this.jumpCooldown -= dt;
+
     if (!this.alive) {
-      this.character.update(dt, { speed: 0, grounded: true, aiming: false, crouch: false, dead: true });
+      this.weapons.update(dt, ctx);   /* let stray shots finish resolving */
+      this.character.group.position.copy(this.pos);
+      this.character.update(dt, { speed: 0, grounded: true, aiming: false, crouch: false });
+      if (this._hiddenAt > 0 && performance.now() - this._hiddenAt > 4000) {
+        this.character.group.visible = false;
+        this._hiddenAt = 0;
+      }
       return;
     }
-    var others = ctx.players || [];
 
-    /* --- perception, at a modest rate so 20 bots are cheap --- */
+    var others = ctx.targets || ctx.players || [];
+
+    /* --- perception at a modest rate, so 20 bots stay cheap --- */
     this.thinkTimer -= dt;
     if (this.thinkTimer <= 0) {
-      this.thinkTimer = 0.18 + Math.random() * 0.12;
+      var period = 0.19 + Math.random() * 0.12;
+      this.thinkTimer = period;
       var seen = this.nearestEnemy(others);
       if (seen) {
-        if (seen !== this.target) this.reactTimer = REACTION * (1.6 - this.skill);
+        if (seen !== this.target) this.reactTimer = REACTION * (1.7 - this.skill);
         this.target = seen;
         this.targetSeen = LOSE_SIGHT;
       } else if (this.target) {
-        this.targetSeen -= this.thinkTimer;
+        this.targetSeen -= period;
         if (this.targetSeen <= 0 || this.target.alive === false) {
           this.target = null;
           this.state = 'roam';
+          this.reactTimer = 0;
         }
       }
     }
@@ -299,21 +340,18 @@
       this.state = 'engage';
       var t = this.target;
       var dist = this.pos.distanceTo(t.pos);
+      this.chooseWeaponFor(dist);
       var def = this.weapons.def();
 
-      /* pick a usable weapon for the distance */
-      this.chooseWeaponFor(dist);
-
-      /* aim with a skill-based error */
-      var aim = this._v.set(t.pos.x, t.pos.y + 1.05, t.pos.z);
-      var ex = this.pos.x, ey = this.pos.y + 1.45, ez = this.pos.z;
-      var ax = aim.x - ex, ay = aim.y - ey, az = aim.z - ez;
+      /* aim, with an error that shrinks as skill rises */
+      var ax = t.pos.x - this.pos.x;
+      var ay = (t.pos.y + 1.05) - (this.pos.y + 1.45);
+      var az = t.pos.z - this.pos.z;
       var horiz = Math.hypot(ax, az) || 1;
-      var wantYaw = Math.atan2(ax, az);
-      var wantPitch = Math.atan2(ay, horiz);
-      var err = (1 - this.skill) * 0.11;
-      wantYaw += Math.sin(performance.now() * 0.004 + this.pos.x) * err;
-      wantPitch += Math.cos(performance.now() * 0.003 + this.pos.z) * err * 0.6;
+      var err = (1 - this.skill) * 0.1;
+      var now = performance.now();
+      var wantYaw = Math.atan2(ax, az) + Math.sin(now * 0.004 + this.pos.x) * err;
+      var wantPitch = Math.atan2(ay, horiz) + Math.cos(now * 0.003 + this.pos.z) * err * 0.6;
 
       var yawDiff = ((wantYaw - this.yaw + Math.PI) % (Math.PI * 2)) - Math.PI;
       if (yawDiff < -Math.PI) yawDiff += Math.PI * 2;
@@ -321,18 +359,18 @@
       this.yaw += U.clamp(yawDiff, -turnRate * dt, turnRate * dt);
       this.pitch = U.damp(this.pitch, U.clamp(wantPitch, -0.9, 0.8), 9, dt);
 
-      var onTarget = Math.abs(yawDiff) < 0.18;
+      var onTarget = Math.abs(yawDiff) < 0.2;
 
-      /* combat movement: close the gap or strafe at range */
+      /* combat movement: close distance, or strafe at range */
       if (dist > 34) {
         this.stepToward(dt, t.pos.x, t.pos.z);
       } else if (dist < 6) {
-        this.moveInput = { x: 0, z: -1 };     /* back off */
+        this.moveInput = { x: 0, z: -1 };
         this.aiming = true;
       } else {
         this.strafeTimer -= dt;
         if (this.strafeTimer <= 0) {
-          this.strafeTimer = 0.6 + Math.random() * 1.0;
+          this.strafeTimer = 0.6 + Math.random();
           this.strafeDir *= -1;
         }
         this.moveInput = { x: this.strafeDir, z: Math.random() < 0.7 ? 0.35 : 0 };
@@ -340,13 +378,12 @@
       }
 
       this.reactTimer -= dt;
-      if (onTarget && this.reactTimer <= 0 && def) {
-        var ideal = (def.range && def.range.max) || 40;
-        if (dist < ideal * 1.15) fireWanted = true;
+      if (onTarget && this.reactTimer <= 0 && def && dist < def.range * 1.15) {
+        fireWanted = true;
       }
-      /* reload when the magazine runs dry */
+
       var item = this.inventory.activeItem();
-      if (item && item.kind === 'weapon' && def && item.mag <= 0) this.weapons.startReload();
+      if (item && item.kind === 'weapon' && item.mag <= 0) this.weapons.startReload();
     } else {
       /* --- roaming --- */
       this.aiming = false;
@@ -357,30 +394,28 @@
       }
       if (this.waypoint) {
         this.stepToward(dt, this.waypoint.x, this.waypoint.z);
-        /* arrived at loot we wanted? */
-        if (this.lootEntry && this.pos.distanceTo(this.lootEntry.mesh.position) < 1.9) {
+        if (this.lootEntry && this.pos.distanceTo(this.lootEntry.mesh.position) < 2.0) {
           this.tryGrabLoot(ctx);
         }
       }
-      /* heal when safe and hurt */
-      if (this.health < 55 && Math.random() < 0.01) this.health = Math.min(100, this.health + 25);
+      if (this.health < 55 && this.inventory && Math.random() < 0.008) {
+        this.heal(25);
+      }
     }
 
-    /* --- the ONE weapon controller, driven by bot intent --- */
-    this.weapons.intentFire = fireWanted && this.alive;
+    /* --- the ONE shared weapon controller, driven by bot intent --- */
+    this.weapons.intentFire = !!fireWanted;
     this.weapons.update(dt, ctx);
 
     /* --- movement through shared capsule physics --- */
     var speed = this.crouch ? 2.3 : 4.6;
     if (this.sprinting) speed = 7.2;
     if (this.aiming) speed = Math.min(speed, 2.6);
-    if (!this.grounded) speed *= 0.94;
 
     var fx = Math.sin(this.yaw), fz = Math.cos(this.yaw);
     var rx = -Math.cos(this.yaw), rz = Math.sin(this.yaw);
-    var mz = this.moveInput.z, mx = this.moveInput.x;
-    var dx = fx * mz + rx * mx;
-    var dz = fz * mz + rz * mx;
+    var dx = fx * this.moveInput.z + rx * this.moveInput.x;
+    var dz = fz * this.moveInput.z + rz * this.moveInput.x;
     var len = Math.hypot(dx, dz);
     if (len > 0.0001) { dx /= len; dz /= len; }
 
@@ -395,7 +430,7 @@
     this.wantJump = false;
 
     this.vel.y -= BN.Physics.GRAVITY * dt;
-    this.vel.y = Math.max(this.vel.y, -55);
+    if (this.vel.y < -55) this.vel.y = -55;
 
     BN.Physics.moveXZ(this.world, this.pos, this.vel.x * dt, this.vel.z * dt, this.radius, this.height);
     this.pos.y += this.vel.y * dt;
@@ -415,7 +450,7 @@
 
     if (this.pos.y < -0.95) {
       this.pos.y = U.damp(this.pos.y, -0.95, 6, dt);
-      this.vel.y = Math.max(this.vel.y, 0);
+      if (this.vel.y < 0) this.vel.y = 0;
     }
 
     var half = BN.World.HALF - 6;
@@ -424,20 +459,18 @@
 
     /* --- presentation --- */
     var planar = Math.hypot(this.vel.x, this.vel.z);
-    var cg = this.character.group;
-    cg.position.copy(this.pos);
-    cg.rotation.y = this.yaw;
+    this.character.group.position.copy(this.pos);
+    this.character.group.rotation.y = this.yaw;
     this.character.update(dt, {
       speed: planar,
       grounded: this.grounded,
       aiming: this.aiming,
       crouch: this.crouch,
-      pitch: this.pitch,
       recoil: this.weapons.recoilKick
     });
   };
 
-  /* swap to the best weapon the bot owns for this distance */
+  /* swap to the weapon that suits this distance best */
   Bot.prototype.chooseWeaponFor = function (dist) {
     var best = -1, bestScore = -1;
     for (var i = 0; i < 5; i++) {
@@ -445,44 +478,45 @@
       if (!it || it.kind !== 'weapon') continue;
       var d = BN.WEAPONS[it.defId];
       if (!d) continue;
-      var max = (d.range && d.range.max) || 40;
       var score = 1;
-      if (dist < 12 && d.category === 'shotgun') score = 3;
-      else if (dist > 30 && (d.category === 'sniper' || d.category === 'rifle')) score = 3;
-      else if (dist > 30 && d.category === 'shotgun') score = 0.1;
-      else if (d.category === 'smg' && dist < 25) score = 2.2;
-      if (dist > max) score *= 0.2;
+      if (d.category === 'shotgun') score = dist < 12 ? 3 : dist > 30 ? 0.15 : 1.6;
+      else if (d.category === 'sniper') score = dist > 30 ? 3 : 0.5;
+      else if (d.category === 'assault') score = dist > 18 ? 2.4 : 1.6;
+      else if (d.category === 'smg') score = dist < 25 ? 2.2 : 0.8;
+      else if (d.category === 'pistol') score = 0.7;
+      else if (d.category === 'special') score = 1.2;
+      if (dist > d.range) score *= 0.2;
       if (score > bestScore) { bestScore = score; best = i; }
     }
     if (best >= 0 && best !== this.inventory.active) {
-      this.inventory.select(best);
-      this.weapons.reset();
-      this.syncWeaponModel();
+      if (this.inventory.setActive(best)) {
+        this.weapons.reset();
+        this.syncWeaponModel();
+      }
     }
   };
 
   Bot.prototype.tryGrabLoot = function (ctx) {
     var e = this.lootEntry;
-    if (!e || !e.item) { this.lootEntry = null; return; }
-    if (this.pos.distanceTo(e.mesh.position) > 2.2) return;
-    if (ctx.loot.focus !== e) ctx.loot.focus = e;
+    this.lootEntry = null;
+    this.waypoint = null;
+    if (!e || !e.item || !ctx.loot) return;
+    if (this.pos.distanceTo(e.mesh.position) > 2.4) return;
+    ctx.loot.focus = e;
     var picked = ctx.loot.tryPickup(this);
     if (picked) {
       this.syncWeaponModel();
-      if (this.inventory.activeItem() && this.inventory.activeItem().kind === 'weapon') {
-        this.weapons.reset();
-      }
+      this.weapons.reset();
     }
-    this.lootEntry = null;
-    this.waypoint = null;
   };
 
   Bot.prototype.dispose = function () {
-    if (this.character.group.parent) this.character.group.parent.remove(this.character.group);
+    if (this.character && this.character.group && this.character.group.parent) {
+      this.character.group.parent.remove(this.character.group);
+    }
   };
 
   /* ------------------------------ director ----------------------------- */
-  /* Owns the bot roster, keeps them spread out, prunes the dead. */
   function BotManager(THREE, world, scene, opts) {
     opts = opts || {};
     this.THREE = THREE;
@@ -493,14 +527,14 @@
   }
   BN.BotManager = BotManager;
 
-  BotManager.prototype.spawnWave = function (playerPos, opts) {
-    opts = opts || {};
-    var half = BN.World.HALF - 40;
+  BotManager.prototype.spawnWave = function (playerPos) {
+    var half = BN.World.HALF - 42;
     for (var i = 0; i < this.maxBots; i++) {
       var bot = new BN.Bot(this.THREE, this.world, this.scene, {
         skill: U.rand(0.4, 0.92)
       });
-      /* find a spot away from the player's landing area */
+
+      /* land them away from the player's deployment area */
       var x = 0, z = 0, tries = 0;
       do {
         x = U.rand(-half, half);
@@ -508,13 +542,12 @@
         tries++;
       } while (tries < 24 && playerPos && Math.hypot(x - playerPos.x, z - playerPos.z) < 55);
 
-      var y = this.world.heightAt(x, z);
-      bot.spawn(x, y + 0.5, z);
+      bot.spawn(x, this.world.heightAt(x, z) + 0.5, z);
 
-      /* starting kit: sometimes a gun, sometimes nothing (so they loot) */
-      if (Math.random() < 0.7) {
-        var pool = ['ar_common', 'smg_uncommon', 'shotgun_common', 'pistol_common', 'ar_rare', 'sniper_rare'];
-        bot.inventory.set(0, BN.makeWeaponItem(pool[(Math.random() * pool.length) | 0]));
+      /* starting kit — some spawn empty so they have to loot */
+      if (Math.random() < 0.72) {
+        var item = BN.makeWeaponItem(U.pick(KIT));
+        if (item) bot.inventory.add(item);
       }
       bot.syncWeaponModel();
       this.bots.push(bot);
@@ -529,21 +562,7 @@
   };
 
   BotManager.prototype.update = function (dt, ctx) {
-    var all = ctx.players;
-    for (var i = 0; i < this.bots.length; i++) {
-      var b = this.bots[i];
-      b.update(dt, ctx);
-      if (!b.alive && b.character.group.visible && !b._hiddenAt) {
-        b._hiddenAt = performance.now();
-      }
-      /* fade corpses out of the way after a few seconds */
-      if (b._hiddenAt && performance.now() - b._hiddenAt > 4000) {
-        b.character.group.visible = false;
-        b._hiddenAt = -1;
-      }
-    }
-    /* keep target lists fresh for the next frame */
-    ctx.players = all;
+    for (var i = 0; i < this.bots.length; i++) this.bots[i].update(dt, ctx);
   };
 
   BotManager.prototype.clear = function () {
